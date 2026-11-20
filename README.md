@@ -1,10 +1,10 @@
 # panvk-JM-kirin
 
-专为麒麟（Kirin）机型维护的 PanVK **JM 后端**：基于 Mesa 27.0.0-devel（保留 JimVulkan 版权头），只保留 job manager 路径（Mali v6 / v7 / v9），已删除全部 CSF（arch ≥ 10）代码。
+专为麒麟（Kirin）机型维护的 PanVK **JM 后端**，代码基于 [JimVulkan/mali-panvk](https://github.com/JimVulkan/mali-panvk)（Mesa 27.0.0-devel，保留 JimVulkan 版权头），只保留 job manager 路径（Mali v6 / v7 / v9），已删除全部 CSF（arch ≥ 10）代码。
 
 本仓库只放源码，**不提供任何预编译包**（zip / so 均不在仓库内）。
 
-English: PanVK job-manager backend for Kirin devices (Mali-G78 and other pre-CSF Valhall/Bifrost GPUs on Arm kbase). Source only, no prebuilt packages.
+English: PanVK job-manager backend for Kirin devices, based on [JimVulkan/mali-panvk](https://github.com/JimVulkan/mali-panvk) (Mali-G78 and other pre-CSF Valhall/Bifrost GPUs on Arm kbase). Source only, no prebuilt packages.
 
 ## 适用机型
 
@@ -69,6 +69,10 @@ kbase: MEM_IMPORT uses a 32-byte request
 ```
 
 如果 `atom layout` 之后还有 `atom layout: 64-byte atoms refused`，说明内核 UAPI 与实测机不同，属预期探测，不影响后续布局选择。
+
+## 来源
+
+本仓库的驱动代码基于 [JimVulkan/mali-panvk](https://github.com/JimVulkan/mali-panvk)。在其代码之上删除了 CSF 后端、只保留 JM（v6 / v7 / v9），并加入上面列出的麒麟适配；版权与许可仍归原作者与 Mesa 项目所有。
 
 ## 许可
 
