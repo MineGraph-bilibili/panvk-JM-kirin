@@ -38,7 +38,7 @@ English: PanVK job-manager backend for Kirin devices, based on [JimVulkan/mali-p
 
 ## WSI
 
-使用标准 `wsi_common` 路径（`src/panfrost/vulkan/panvk_wsi.c` 只是 common 的薄封装），**不含** zero-copy 演示路径。
+使用标准 `wsi_common` 路径（`src/panfrost/vulkan/panvk_wsi.c` 只是 common 的薄封装）。
 
 ## 构建
 
