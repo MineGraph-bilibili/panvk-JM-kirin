@@ -148,6 +148,13 @@ panvk_kbase_submit_aborted(struct panvk_kbase_done *d)
    panvk_kbase_submit_finish(d, false, false);
 }
 
+/* A submission whose GPU atoms faulted before the rest of it was prepared. */
+static void
+panvk_kbase_submit_faulted(struct panvk_kbase_done *d)
+{
+   panvk_kbase_submit_finish(d, false, true);
+}
+
 /*
  * kbase: every batch of a vkQueueSubmit in one JOB_SUBMIT, each atom waiting on the one before
  * it, and no wait at all. Submitted and waited for batch by batch, a Minecraft frame (about 30
@@ -218,8 +225,23 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
 
          /* More than one submission takes: send what there is, the rest runs after it. */
          if (nr_atoms + 2 > PAN_KMOD_KBASE_MAX_ATOMS) {
-            if (!pan_kmod_kbase_submit_async(dev->kmod.dev, atoms, nr_atoms, NULL, NULL, NULL))
-               mesa_loge("panvk: the kbase submission was refused");
+            const uint64_t split_seq =
+               pan_kmod_kbase_submit_async(dev->kmod.dev, atoms, nr_atoms, NULL, NULL, NULL);
+            if (!split_seq) {
+               if (refresh)
+                  panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, 0);
+               panvk_kbase_submit_aborted(d);
+               return;
+            }
+            /* The rest of this submit rewrites batch job headers and tiler descriptors. The
+             * partial submission has no callback, so wait for it before touching that state. */
+            pan_kmod_kbase_wait_seq(dev->kmod.dev, split_seq);
+            if (pan_kmod_kbase_faulted(dev->kmod.dev)) {
+               if (refresh)
+                  panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, 0);
+               panvk_kbase_submit_faulted(d);
+               return;
+            }
             nr_atoms = 0;
          }
 
