@@ -272,6 +272,8 @@ struct kbase_queue {
    unsigned in_flight;               /* submissions */
    pthread_t thread;
    bool thread_started, stop, fence_warned;
+   /* A GPU atom faulted; the queue must not take more work. */
+   bool faulted;
 };
 
 struct kbase_kmod_dev {
@@ -1706,6 +1708,7 @@ kbase_event_thread(void *arg)
                mesa_loge("kbase: atom %u finished with event code %u, not DONE", an,
                          ev[i].event_code);
                sub->ok = false;
+               q->faulted = true;
             }
          }
          q->is_fence[an] = false;
@@ -1748,6 +1751,7 @@ kbase_queue_init(struct kbase_queue *q)
    pthread_condattr_destroy(&attr);
    q->free_atoms = 255;
    q->next_seq = 1;
+   q->faulted = false;
 }
 
 static void
@@ -2026,6 +2030,17 @@ pan_kmod_kbase_wait_seq_timeout(struct pan_kmod_dev *dev, uint64_t seq, int64_t 
    }
    pthread_mutex_unlock(&q->lock);
    return done;
+}
+
+bool
+pan_kmod_kbase_faulted(struct pan_kmod_dev *dev)
+{
+   struct kbase_queue *q = kbase_queue(dev);
+
+   pthread_mutex_lock(&q->lock);
+   const bool faulted = q->faulted;
+   pthread_mutex_unlock(&q->lock);
+   return faulted;
 }
 
 static void

@@ -95,6 +95,9 @@ void pan_kmod_kbase_wait_seq(struct pan_kmod_dev *dev, uint64_t seq);
 bool pan_kmod_kbase_wait_seq_timeout(struct pan_kmod_dev *dev, uint64_t seq,
                                      int64_t abs_timeout_ns);
 
+/* True once a GPU atom has faulted; the queue must not take more work. */
+bool pan_kmod_kbase_faulted(struct pan_kmod_dev *dev);
+
 /* Submit atoms and wait for them. Returns false if the kernel refused the submission or an atom
  * completed with a fault. */
 bool pan_kmod_kbase_submit(struct pan_kmod_dev *dev,

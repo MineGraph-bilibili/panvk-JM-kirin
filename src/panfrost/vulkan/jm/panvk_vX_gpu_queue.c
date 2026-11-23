@@ -105,17 +105,23 @@ struct panvk_kbase_done {
    uint32_t *signals;
 };
 
-/* On the kmod's event thread, when every atom of the submission has reported. The command
- * buffers cannot have been reset or freed yet: they are pending until the signals below. */
+/* Once every atom of the submission has reported. A GPU fault poisons the device: stop the queue
+ * instead of letting the next submission fault on top of it. The signals are still delivered so
+ * nothing waits forever; the next submit and QueueWaitIdle return DEVICE_LOST. */
 static void
-panvk_kbase_submit_done(void *data, bool ok)
+panvk_kbase_submit_finish(struct panvk_kbase_done *d, bool ok, bool gpu_event)
 {
-   struct panvk_kbase_done *d = data;
    struct panvk_device *dev = to_panvk_device(d->queue->vk.base.device);
 
    if (!ok) {
-      mesa_loge("panvk: the kbase submission did not complete");
-      panvk_kbase_report_faults(dev, d->cmdbufs, d->nr_cmdbufs);
+      if (gpu_event) {
+         mesa_loge("panvk: the kbase submission faulted");
+         panvk_kbase_report_faults(dev, d->cmdbufs, d->nr_cmdbufs);
+         vk_device_set_lost(&dev->vk, "kbase submission faulted");
+      } else {
+         mesa_loge("panvk: the kbase submission was refused");
+         vk_device_set_lost(&dev->vk, "kbase submission refused");
+      }
    }
 
    for (uint32_t j = 0; j < d->nr_cmdbufs; ++j) {
@@ -127,6 +133,19 @@ panvk_kbase_submit_done(void *data, bool ok)
       dev->vk.sync->signal(dev->vk.sync, d->signals, d->nr_signals);
 
    free(d);
+}
+
+static void
+panvk_kbase_submit_done(void *data, bool ok)
+{
+   panvk_kbase_submit_finish(data, ok, !ok);
+}
+
+/* A submission the kmod refused before any atom was queued. */
+static void
+panvk_kbase_submit_aborted(struct panvk_kbase_done *d)
+{
+   panvk_kbase_submit_finish(d, false, false);
 }
 
 /*
@@ -278,7 +297,7 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
       panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, seq);
    if (!seq) {
       /* Signal anyway, so nothing waits forever on work that was never sent. */
-      panvk_kbase_submit_done(d, false);
+      panvk_kbase_submit_aborted(d);
       return;
    }
 
@@ -559,6 +578,9 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
 {
    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+
+   if (vk_device_is_lost(&dev->vk))
+      return VK_ERROR_DEVICE_LOST;
 
    unsigned nr_semaphores = submit->wait_count + 1;
    uint32_t semaphores[nr_semaphores];
