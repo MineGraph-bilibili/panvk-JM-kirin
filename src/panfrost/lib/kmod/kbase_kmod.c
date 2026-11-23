@@ -1857,9 +1857,19 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
    uint8_t rel_to_real[256] = {0};
    unsigned next = 1;
    for (unsigned i = 0; i < need; i++) {
-      while (q->owner[next])
+      while (next <= 255 && q->owner[next])
          next++;
-      assert(next <= 255);
+      if (next > 255) {
+         mesa_loge("kbase: no free atom number for %u atoms", need);
+         for (unsigned k = 0; k < i; k++) {
+            q->owner[real[k]] = NULL;
+            q->is_fence[real[k]] = false;
+         }
+         pthread_mutex_unlock(&q->lock);
+         free(sub);
+         free(fsub);
+         return 0;
+      }
       real[i] = next;
       q->owner[next] = split && i == nr_atoms ? fsub : sub;
       q->is_fence[next] = fence && i == nr_atoms;
