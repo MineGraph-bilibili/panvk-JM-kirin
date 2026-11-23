@@ -1873,6 +1873,7 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
    memcpy(track, q->track, sizeof(track));
 
    struct kbase_jd_atom jd[PAN_KMOD_KBASE_MAX_ATOMS + 1];
+   bool dep_overflow = false;
    memset(jd, 0, need * sizeof(jd[0]));
    for (unsigned i = 0; i < nr_atoms; i++) {
       assert(atoms[i].atom_number != 0);
@@ -1896,9 +1897,12 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
       for (unsigned t = 0; t < PAN_KMOD_KBASE_NR_TRACKS; t++) {
          if ((wait & (1u << t)) && !kbase_add_order_dep(&jd[i], track[t])) {
             mesa_loge("kbase: atom %u waits for more than two atoms", atoms[i].atom_number);
-            assert(!"too many atom waits");
+            dep_overflow = true;
+            break;
          }
       }
+      if (dep_overflow)
+         break;
       const uint8_t join = all ? (1u << PAN_KMOD_KBASE_NR_TRACKS) - 1 : atoms[i].join;
       for (unsigned t = 0; t < PAN_KMOD_KBASE_NR_TRACKS; t++) {
          if (join & (1u << t))
@@ -1911,7 +1915,7 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
       int fd;
       int stream_fd;
    } base_fence = {-1, -1};
-   if (fence) {
+   if (fence && !dep_overflow) {
       struct kbase_jd_atom *f = &jd[nr_atoms];
       f->jc = (uintptr_t)&base_fence;
       f->core_req = KBASE_JD_REQ_SOFT_FENCE_TRIGGER;
@@ -1919,8 +1923,22 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
       f->udata[0] = KBASE_ATOM_TAG;
       f->udata[1] = seq;
       /* After everything, this submission's atoms included. */
-      kbase_add_order_dep(f, track[0]);
-      kbase_add_order_dep(f, track[1]);
+      if (!kbase_add_order_dep(f, track[0]) ||
+          !kbase_add_order_dep(f, track[1])) {
+         mesa_loge("kbase: fence atom waits for more than two atoms");
+         dep_overflow = true;
+      }
+   }
+
+   if (dep_overflow) {
+      for (unsigned i = 0; i < need; i++) {
+         q->owner[real[i]] = NULL;
+         q->is_fence[real[i]] = false;
+      }
+      pthread_mutex_unlock(&q->lock);
+      free(sub);
+      free(fsub);
+      return 0;
    }
 
    uint8_t packed[(PAN_KMOD_KBASE_MAX_ATOMS + 1) * KBASE_ATOM_STRIDE];
