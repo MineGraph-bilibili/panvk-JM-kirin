@@ -26,6 +26,10 @@
 
 #include "panvk_gs.h"
 
+/* JM exposes one GPU queue (panvk_physical_device.c: queueCount = arch >= 10 ? 2 : 1). That is
+ * what lets the CPU treat an available wait semaphore as already submitted below. */
+static_assert(PAN_ARCH < 10, "kbase JM submission assumes a single GPU queue");
+
 #include "vk_drm_syncobj.h"
 #include "vk_framebuffer.h"
 
