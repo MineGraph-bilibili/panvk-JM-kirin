@@ -1961,11 +1961,14 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
 
    bool submitted = !pan_kmod_ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &req);
    const int submit_errno = errno;
-   if (!submitted && submit_errno == EINVAL && !kdev->atom_layout_fixed) {
+   if (!submitted && submit_errno == EINVAL && !kdev->atom_layout_fixed &&
+       q->in_flight == 0) {
       /* The probe could not get a dependency-only atom past this kernel, so no layout is proven.
        * A real batch carries job chains and can pass validation where the probe did not, so try
        * the remaining layouts on this first batch and keep whichever the kernel takes. EINVAL is
-       * returned during validation, before any atom is queued, so a retry cannot run work twice. */
+       * returned during validation, before any atom is queued, so a retry cannot run work twice.
+       * Require an idle queue for the same reason: if anything is already in flight, refuse
+       * instead of risking a second submission of the batch. */
       for (unsigned l = 0; l < KBASE_ATOM_LAYOUT_COUNT && !submitted; l++) {
          if ((int)l == kdev->atom_layout)
             continue;
