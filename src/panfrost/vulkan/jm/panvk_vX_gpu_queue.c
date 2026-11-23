@@ -84,6 +84,12 @@ panvk_kbase_report_faults(struct panvk_device *dev, struct panvk_cmd_buffer *con
    unsigned b = 0;
    for (uint32_t j = 0; j < nr_cmdbufs; ++j) {
       list_for_each_entry(struct panvk_batch, batch, &cmdbufs[j]->batches, node) {
+         const struct panvk_priv_bo *heap = dev->tiler_heap[batch->tiler_heap];
+         mesa_loge("panvk: batch %u: heap %u (%zu KiB), tls %u B, vtc %u, frag %u", b,
+                   batch->tiler_heap,
+                   heap ? pan_kmod_bo_size(heap->bo) / 1024 : (size_t)0,
+                   batch->tlsinfo.tls.size, batch->vtc_jc.first_job != 0,
+                   batch->frag_jc.first_job != 0);
          unsigned k = 0;
          util_dynarray_foreach(&batch->jobs, void *, job) {
             const uint32_t *w = *job;
