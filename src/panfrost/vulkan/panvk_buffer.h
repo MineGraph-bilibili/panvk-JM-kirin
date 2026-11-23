@@ -11,15 +11,9 @@
 #include "vk_buffer.h"
 
 struct panvk_priv_bo;
-struct pan_kmod_bo;
 
 struct panvk_buffer {
    struct vk_buffer vk;
-
-   /* kbase: real BO backing a sparse buffer whose range cannot be mapped
-    * with PAN_KMOD_VM_OP_OP_MAP_SPARSE.  NULL for every other buffer.
-    */
-   struct pan_kmod_bo *sparse_backing;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_buffer, vk.base, VkBuffer,

@@ -66,15 +66,6 @@ write_desc_data(struct panvk_descriptor_set *set, uint32_t binding,
    assert(index + DIV_ROUND_UP(desc_size, PANVK_DESCRIPTOR_SIZE) <=
           set->layout->desc_count);
 
-   /* Release builds have no asserts: refuse out-of-bounds writes (the push
-    * set capacity is derived from the layout, a bogus template entry must not
-    * corrupt adjacent heap objects). */
-   if (unlikely(set->descs.host == NULL || index >= set->layout->desc_count ||
-                index + DIV_ROUND_UP(desc_size, PANVK_DESCRIPTOR_SIZE) >
-                   set->layout->desc_count ||
-                desc_data == NULL))
-      return;
-
    uint32_t offset_B = desc_offset + index * PANVK_DESCRIPTOR_SIZE;
 
    memcpy((char *)set->descs.host + offset_B, desc_data, desc_size);

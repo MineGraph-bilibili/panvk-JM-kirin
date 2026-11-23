@@ -272,8 +272,6 @@ struct kbase_queue {
    unsigned in_flight;               /* submissions */
    pthread_t thread;
    bool thread_started, stop, fence_warned;
-   /* A GPU atom faulted; the queue must not take more work. */
-   bool faulted;
 };
 
 struct kbase_kmod_dev {
@@ -283,8 +281,6 @@ struct kbase_kmod_dev {
    struct kbase_queue queue;
    /* enum kbase_atom_layout, measured when the context is created. */
    int atom_layout;
-   /* True once a layout was accepted somewhere: the probe, or the first real batch's fallback.
-    * Until then every stride is still a guess and a failed submit may try the others. */
    bool atom_layout_fixed;
    /* JS0_FEATURES: bit n = the fragment slot runs job type n (G72: NULL, WRITE_VALUE,
     * CACHE_FLUSH, FRAGMENT). */
@@ -467,10 +463,6 @@ kbase_kmod_query_props(int fd, struct pan_kmod_dev_props *props, uint32_t *js0_f
    return true;
 }
 
-/* What VERSION_CHECK answered, kept for the dup()ed fd of the logical device: a context that
- * already exists refuses the handshake, and the atom layout still needs the version. */
-static unsigned kbase_uapi_major;
-
 static struct pan_kmod_dev *
 kbase_kmod_dev_create(int fd, uint32_t flags, const struct pan_kmod_allocator *allocator)
 {
@@ -496,15 +488,11 @@ kbase_kmod_dev_create(int fd, uint32_t flags, const struct pan_kmod_allocator *a
     * refuses, and once refused no handshake succeeds on that file. So 52 goes first. A JM kbase
     * refuses 52 with EPERM before the handshake without changing anything, or, where 52 is its
     * handshake too, answers with its own major (11), which the context then simply runs at. */
-   struct kbase_ioctl_version_check vc = {.major = 0, .minor = 0};
+   struct kbase_ioctl_version_check vc = {.major = 1, .minor = 21};
    bool fresh_context = pan_kmod_ioctl(fd, KBASE_IOCTL_CSF_VERSION_CHECK, &vc) == 0;
    if (!fresh_context) {
-      vc = (struct kbase_ioctl_version_check){.major = 0, .minor = 0};
+      vc = (struct kbase_ioctl_version_check){.major = 11, .minor = 31};
       fresh_context = pan_kmod_ioctl(fd, KBASE_IOCTL_VERSION_CHECK, &vc) == 0;
-   }
-   if (fresh_context) {
-      kbase_uapi_major = vc.major;
-      mesa_logi("kbase: kernel UAPI %u.%u", vc.major, vc.minor);
    }
 
    if (fresh_context) {
@@ -577,12 +565,8 @@ kbase_kmod_dev_create(int fd, uint32_t flags, const struct pan_kmod_allocator *a
       }
    } else {
       kbase_dev->atom_layout = kbase_probe_atom_layout_fd(
-         fd, vc.major ? vc.major : kbase_uapi_major, &kbase_dev->atom_layout_fixed);
+         fd, vc.major ? vc.major : 11, &kbase_dev->atom_layout_fixed);
    }
-   /* Build marker: tells from logcat which driver package is really loaded, and which
-    * arch the kbase backend runs on. */
-   mesa_logi("kbase: panvk kbase backend uapi118-9 (arch %u, csf %d)",
-             (unsigned)PAN_ARCH_MAJOR(kbase_dev->base.props.gpu_id), kbase_dev->csf);
    return &kbase_dev->base;
 
 err_free_dev:
@@ -805,8 +789,8 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
    int dmabuf = fd;
    union kbase_ioctl_mem_import req;
    /* The ioctl number encodes the request size, and vendors disagree on it (24 on most,
-    * 40 on MT6993). Probe the plausible sizes, remember the one that worked, and retry it
-    * first on the next import. */
+    * 40 on MT6993, 32 on Huawei's kernel). Probe the plausible sizes, remember the one that
+    * worked, and retry it first on the next import. */
    static unsigned import_size;
    static const uint8_t sizes[] = {24, 40, 32, 48, 56};
    unsigned order[ARRAY_SIZE(sizes)];
@@ -1708,7 +1692,6 @@ kbase_event_thread(void *arg)
                mesa_loge("kbase: atom %u finished with event code %u, not DONE", an,
                          ev[i].event_code);
                sub->ok = false;
-               q->faulted = true;
             }
          }
          q->is_fence[an] = false;
@@ -1751,7 +1734,6 @@ kbase_queue_init(struct kbase_queue *q)
    pthread_condattr_destroy(&attr);
    q->free_atoms = 255;
    q->next_seq = 1;
-   q->faulted = false;
 }
 
 static void
@@ -1857,19 +1839,9 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
    uint8_t rel_to_real[256] = {0};
    unsigned next = 1;
    for (unsigned i = 0; i < need; i++) {
-      while (next <= 255 && q->owner[next])
+      while (q->owner[next])
          next++;
-      if (next > 255) {
-         mesa_loge("kbase: no free atom number for %u atoms", need);
-         for (unsigned k = 0; k < i; k++) {
-            q->owner[real[k]] = NULL;
-            q->is_fence[real[k]] = false;
-         }
-         pthread_mutex_unlock(&q->lock);
-         free(sub);
-         free(fsub);
-         return 0;
-      }
+      assert(next <= 255);
       real[i] = next;
       q->owner[next] = split && i == nr_atoms ? fsub : sub;
       q->is_fence[next] = fence && i == nr_atoms;
@@ -1883,7 +1855,6 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
    memcpy(track, q->track, sizeof(track));
 
    struct kbase_jd_atom jd[PAN_KMOD_KBASE_MAX_ATOMS + 1];
-   bool dep_overflow = false;
    memset(jd, 0, need * sizeof(jd[0]));
    for (unsigned i = 0; i < nr_atoms; i++) {
       assert(atoms[i].atom_number != 0);
@@ -1907,12 +1878,9 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
       for (unsigned t = 0; t < PAN_KMOD_KBASE_NR_TRACKS; t++) {
          if ((wait & (1u << t)) && !kbase_add_order_dep(&jd[i], track[t])) {
             mesa_loge("kbase: atom %u waits for more than two atoms", atoms[i].atom_number);
-            dep_overflow = true;
-            break;
+            assert(!"too many atom waits");
          }
       }
-      if (dep_overflow)
-         break;
       const uint8_t join = all ? (1u << PAN_KMOD_KBASE_NR_TRACKS) - 1 : atoms[i].join;
       for (unsigned t = 0; t < PAN_KMOD_KBASE_NR_TRACKS; t++) {
          if (join & (1u << t))
@@ -1925,7 +1893,7 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
       int fd;
       int stream_fd;
    } base_fence = {-1, -1};
-   if (fence && !dep_overflow) {
+   if (fence) {
       struct kbase_jd_atom *f = &jd[nr_atoms];
       f->jc = (uintptr_t)&base_fence;
       f->core_req = KBASE_JD_REQ_SOFT_FENCE_TRIGGER;
@@ -1933,22 +1901,8 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
       f->udata[0] = KBASE_ATOM_TAG;
       f->udata[1] = seq;
       /* After everything, this submission's atoms included. */
-      if (!kbase_add_order_dep(f, track[0]) ||
-          !kbase_add_order_dep(f, track[1])) {
-         mesa_loge("kbase: fence atom waits for more than two atoms");
-         dep_overflow = true;
-      }
-   }
-
-   if (dep_overflow) {
-      for (unsigned i = 0; i < need; i++) {
-         q->owner[real[i]] = NULL;
-         q->is_fence[real[i]] = false;
-      }
-      pthread_mutex_unlock(&q->lock);
-      free(sub);
-      free(fsub);
-      return 0;
+      kbase_add_order_dep(f, track[0]);
+      kbase_add_order_dep(f, track[1]);
    }
 
    uint8_t packed[(PAN_KMOD_KBASE_MAX_ATOMS + 1) * KBASE_ATOM_STRIDE];
@@ -1963,12 +1917,11 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
    const int submit_errno = errno;
    if (!submitted && submit_errno == EINVAL && !kdev->atom_layout_fixed &&
        q->in_flight == 0) {
-      /* The probe could not get a dependency-only atom past this kernel, so no layout is proven.
-       * A real batch carries job chains and can pass validation where the probe did not, so try
-       * the remaining layouts on this first batch and keep whichever the kernel takes. EINVAL is
-       * returned during validation, before any atom is queued, so a retry cannot run work twice.
-       * Require an idle queue for the same reason: if anything is already in flight, refuse
-       * instead of risking a second submission of the batch. */
+      /* The probe could not get a dependency-only atom past this kernel, so no layout is
+       * proven. A real batch carries job chains and can pass validation where the probe did
+       * not, so try the remaining layouts on this first batch and keep whichever the kernel
+       * takes. EINVAL is returned during validation, before any atom is queued, so a retry
+       * cannot run work twice. Require an idle queue for the same reason. */
       for (unsigned l = 0; l < KBASE_ATOM_LAYOUT_COUNT && !submitted; l++) {
          if ((int)l == kdev->atom_layout)
             continue;
@@ -1977,7 +1930,8 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
          submitted = !pan_kmod_ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &req);
          if (submitted) {
             kdev->atom_layout = l;
-            mesa_logw("kbase: JOB_SUBMIT took %u-byte atoms; switching atom layout", req.stride);
+            mesa_logw("kbase: JOB_SUBMIT took %u-byte atoms; switching atom layout",
+                      req.stride);
          } else {
             mesa_logi("kbase: %u-byte atoms also refused (err=%d)", req.stride, errno);
          }
@@ -2061,17 +2015,6 @@ pan_kmod_kbase_wait_seq_timeout(struct pan_kmod_dev *dev, uint64_t seq, int64_t 
    }
    pthread_mutex_unlock(&q->lock);
    return done;
-}
-
-bool
-pan_kmod_kbase_faulted(struct pan_kmod_dev *dev)
-{
-   struct kbase_queue *q = kbase_queue(dev);
-
-   pthread_mutex_lock(&q->lock);
-   const bool faulted = q->faulted;
-   pthread_mutex_unlock(&q->lock);
-   return faulted;
 }
 
 static void
@@ -2324,28 +2267,6 @@ struct kbase_ioctl_cs_tiler_heap_term {
    _IOW(KBASE_IOCTL_TYPE, 49, struct kbase_ioctl_cs_tiler_heap_term)
 #define KBASE_IOCTL_CS_GET_GLB_IFACE                                                              \
    _IOWR(KBASE_IOCTL_TYPE, 51, struct kbase_ioctl_cs_get_glb_iface)
-/* UAPI 1.6..1.24 ABI: MT6985/r38p1 reports uAPI 1.18 and only implements this
- * one. 1.25+ moved to ioctl 58 with the csi_handlers/reserved fields. */
-union kbase_ioctl_cs_queue_group_create_1_6 {
-   struct {
-      uint64_t tiler_mask;
-      uint64_t fragment_mask;
-      uint64_t compute_mask;
-      uint8_t cs_min;
-      uint8_t priority;
-      uint8_t tiler_max;
-      uint8_t fragment_max;
-      uint8_t compute_max;
-      uint8_t padding[3];
-   } in;
-   struct {
-      uint8_t group_handle;
-      uint8_t padding[3];
-      uint32_t group_uid;
-   } out;
-};
-#define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6                                                     \
-   _IOWR(KBASE_IOCTL_TYPE, 42, union kbase_ioctl_cs_queue_group_create_1_6)
 #define KBASE_IOCTL_CS_QUEUE_GROUP_CREATE                                                         \
    _IOWR(KBASE_IOCTL_TYPE, 58, union kbase_ioctl_cs_queue_group_create)
 
@@ -2398,8 +2319,6 @@ struct pan_kmod_kbase_csf_group {
    unsigned first_sub, nr_subs;
    uint64_t next_seq, done_seq;
    bool faulted;
-   /* The kernel-side group and queues were dropped. */
-   bool terminated;
 };
 
 struct kbase_csf_dev {
@@ -2581,31 +2500,6 @@ kbase_csf_alloc(struct kbase_kmod_dev *kdev, uint64_t size, uint64_t flags, uint
    return p;
 }
 
-/* Under c->lock. Idempotent: drops the group and its queues on the kernel side. A faulted
- * CSG has to go as soon as the fault is seen -- while it stays resident the firmware is left
- * in an error state and every other GPU client (the UI compositor included) gets slow until
- * the device is rebooted, which is exactly what a game crash used to leave behind. */
-static void
-kbase_csf_group_terminate(struct pan_kmod_kbase_csf_group *g)
-{
-   struct kbase_kmod_dev *kdev = g->kdev;
-
-   if (g->terminated)
-      return;
-   g->terminated = true;
-
-   struct kbase_ioctl_cs_queue_group_term t = {.group_handle = g->handle};
-   pan_kmod_ioctl(kdev->base.fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &t);
-
-   for (unsigned q = 0; q < g->nr_queues; q++) {
-      struct kbase_csf_ring *r = &g->ring[q];
-      if (!r->cpu)
-         continue;
-      struct kbase_ioctl_cs_queue_addr a = {.buffer_gpu_addr = r->va};
-      pan_kmod_ioctl(kdev->base.fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &a);
-   }
-}
-
 /* Under c->lock: completes, in order, the leading submissions of g whose queues are all past
  * their targets (all of them if the group faulted). Returns them in out[] for the caller to run
  * outside the lock. */
@@ -2675,17 +2569,9 @@ kbase_csf_thread(void *arg)
                       status & 0xff, sideband, kind == 1 ? notes[o + 36] : 0);
             pthread_mutex_lock(&c->lock);
             list_for_each_entry(struct pan_kmod_kbase_csf_group, g, &c->groups, link) {
-               if (g->handle != handle || g->faulted)
-                  continue;
-               g->faulted = true;
-               /* Drop it right away. A faulted group left resident keeps the CSG firmware
-                * in an error state, and the whole GPU (the UI compositor included) stays
-                * slow until the phone is rebooted. */
-               kbase_csf_group_terminate(g);
+               if (g->handle == handle)
+                  g->faulted = true;
             }
-            /* Wakes submitters parked on a full submission queue: they see the fault and
-             * drop their work instead of waiting for room that never comes. */
-            pthread_cond_broadcast(&c->cond);
             pthread_mutex_unlock(&c->lock);
          }
       }
@@ -2783,32 +2669,11 @@ pan_kmod_kbase_csf_group_create(struct pan_kmod_dev *dev, unsigned nr_queues,
          .compute_max = max_compute,
       },
    };
-   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &gc) == 0) {
-      g->handle = gc.out.group_handle;
-   } else {
-      int saved_errno = errno;
-      /* MT6985/r38p1 (uAPI 1.18) predates ioctl 58: retry with the 1.6 ABI. */
-      union kbase_ioctl_cs_queue_group_create_1_6 gc16 = {
-         .in = {
-            .tiler_mask = 1,
-            .fragment_mask = fragment_mask,
-            .compute_mask = compute_mask,
-            .cs_min = nr_queues,
-            .priority = priority,
-            .tiler_max = 1,
-            .fragment_max = max_fragment,
-            .compute_max = max_compute,
-         },
-      };
-      if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE_1_6, &gc16)) {
-         mesa_loge("kbase: CS_QUEUE_GROUP_CREATE failed (err=%d, 1.6 retry err=%d)",
-                   saved_errno, errno);
-         goto err_free_seq;
-      }
-      g->handle = gc16.out.group_handle;
-      mesa_logw("kbase: CS_QUEUE_GROUP_CREATE fell back to the 1.6 ABI "
-                "(first err=%d)", saved_errno);
+   if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_CS_QUEUE_GROUP_CREATE, &gc)) {
+      mesa_loge("kbase: CS_QUEUE_GROUP_CREATE failed (err=%d)", errno);
+      goto err_free_seq;
    }
+   g->handle = gc.out.group_handle;
 
    for (unsigned q = 0; q < nr_queues; q++) {
       struct kbase_csf_ring *r = &g->ring[q];
@@ -2916,12 +2781,13 @@ pan_kmod_kbase_csf_group_destroy(struct pan_kmod_kbase_csf_group *g)
    list_del(&g->link);
    pthread_mutex_unlock(&c->lock);
 
-   pthread_mutex_lock(&c->lock);
-   kbase_csf_group_terminate(g);
-   pthread_mutex_unlock(&c->lock);
+   struct kbase_ioctl_cs_queue_group_term t = {.group_handle = g->handle};
+   pan_kmod_ioctl(kdev->base.fd, KBASE_IOCTL_CS_QUEUE_GROUP_TERMINATE, &t);
    for (unsigned q = 0; q < g->nr_queues; q++) {
       struct kbase_csf_ring *r = &g->ring[q];
       munmap(r->io, 3 * 4096);
+      struct kbase_ioctl_cs_queue_addr a = {.buffer_gpu_addr = r->va};
+      pan_kmod_ioctl(kdev->base.fd, KBASE_IOCTL_CS_QUEUE_TERMINATE, &a);
       munmap(r->cpu, KBASE_CSF_RING_SIZE);
    }
    munmap((void *)g->seqno, 4096);
@@ -2965,7 +2831,7 @@ kbase_csf_ring_reserve(struct pan_kmod_kbase_csf_group *g, struct kbase_csf_ring
                        unsigned bytes)
 {
    for (unsigned spins = 0; r->insert + bytes - r->output[0] > KBASE_CSF_RING_SIZE; spins++) {
-      if (g->faulted || g->terminated)
+      if (g->faulted)
          return false;
       if (spins > 200000) {
          mesa_loge("kbase: a ring stayed full for 10 s (insert %" PRIu64 ", extract %" PRIu64 ")",
@@ -3001,9 +2867,9 @@ pan_kmod_kbase_csf_submit(struct pan_kmod_kbase_csf_group *g,
    mask &= BITFIELD_MASK(g->nr_queues);
 
    pthread_mutex_lock(&c->lock);
-   while (g->nr_subs == KBASE_CSF_MAX_SUBS && !g->faulted && !g->terminated)
+   while (g->nr_subs == KBASE_CSF_MAX_SUBS && !g->faulted)
       pthread_cond_wait(&c->cond, &c->lock);
-   const bool faulted = g->faulted || g->terminated;
+   const bool faulted = g->faulted;
    /* The submission to wait for, if it is still pending: every queue it signals. */
    uint32_t wait_mask = 0;
    uint64_t wait_target[PAN_KMOD_KBASE_CSF_MAX_QUEUES];

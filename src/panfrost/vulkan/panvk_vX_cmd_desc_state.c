@@ -56,47 +56,41 @@ cmd_desc_state_bind_sets(struct panvk_descriptor_state *desc_state,
 static struct panvk_descriptor_set *
 cmd_get_push_desc_set(struct vk_command_buffer *vk_cmdbuf,
                       struct panvk_descriptor_state *desc_state,
-                      uint32_t set_idx, uint32_t desc_count)
+                      uint32_t set_idx)
 {
    struct panvk_cmd_buffer *cmdbuf =
       container_of(vk_cmdbuf, struct panvk_cmd_buffer, vk);
    struct panvk_cmd_pool *pool =
       container_of(cmdbuf->vk.pool, struct panvk_cmd_pool, vk);
    struct panvk_push_set *push_set;
-   const uint32_t capacity = MAX2(desc_count, MAX_PUSH_DESCS);
 
    assert(set_idx < MAX_SETS);
 
    if (likely(desc_state->push_sets[set_idx])) {
       push_set = container_of(desc_state->push_sets[set_idx],
                               struct panvk_push_set, set);
-   }
-
-   if (desc_state->push_sets[set_idx] == NULL ||
-       push_set->desc_capacity < desc_count) {
-      /* The pool recycle list is never populated by the current lifecycle
-       * code, and touching a stale pool from a worker thread has been seen
-       * crashing in list_del() with a poisoned node. Allocate directly, with
-       * room for the whole layout (maxPushDescriptors only bounds one push,
-       * not the set layout size). */
-      struct panvk_push_set *new_set =
-         vk_zalloc(&pool->vk.alloc,
-                   sizeof(*new_set) + capacity * sizeof(new_set->descs[0]), 8,
-                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-      if (unlikely(!new_set)) {
+   } else if (!list_is_empty(&pool->push_sets)) {
+      push_set =
+         list_first_entry(&pool->push_sets, struct panvk_push_set, base.node);
+      list_del(&push_set->base.node);
+      list_addtail(&push_set->base.node, &cmdbuf->push_sets);
+      memset(push_set->descs, 0, sizeof(push_set->descs));
+   } else {
+      push_set = vk_zalloc(&pool->vk.alloc, sizeof(*push_set), 8,
+                           VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (unlikely(!push_set)) {
          vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
          return NULL;
       }
-      new_set->desc_capacity = capacity;
-      new_set->set.descs.host = new_set->descs;
-      new_set->set.base.device = cmdbuf->vk.base.device;
-      list_addtail(&new_set->base.node, &cmdbuf->push_sets);
-      push_set = new_set;
+      list_addtail(&push_set->base.node, &cmdbuf->push_sets);
    }
 
-   /* Always republish the slot: the capacity check above may have replaced a
-    * too-small push set with a freshly allocated one. */
-   desc_state->push_sets[set_idx] = &push_set->set;
+   if (desc_state->push_sets[set_idx] == NULL) {
+      desc_state->push_sets[set_idx] = &push_set->set;
+      push_set->set.descs.host = push_set->descs;
+      /* Descriptor writes look the device up through the set (null descriptors). */
+      push_set->set.base.device = cmdbuf->vk.base.device;
+   }
 
    struct panvk_descriptor_set *set = desc_state->push_sets[set_idx];
 
@@ -470,15 +464,11 @@ push_desc_set_write(struct panvk_cmd_buffer *cmd,
 {
    VK_FROM_HANDLE(vk_pipeline_layout, playout, info->layout);
 
-   if (info->set >= MESA_VK_MAX_DESCRIPTOR_SETS || info->set >= MAX_SETS ||
-       playout->set_layouts[info->set] == NULL)
-      return;
-
    const struct panvk_descriptor_set_layout *set_layout =
       to_panvk_descriptor_set_layout(playout->set_layouts[info->set]);
 
-   struct panvk_descriptor_set *push_set = cmd_get_push_desc_set(
-      &cmd->vk, desc, info->set, set_layout->desc_count);
+   struct panvk_descriptor_set *push_set =
+      cmd_get_push_desc_set(&cmd->vk, desc, info->set);
    if (!push_set)
       return;
 
@@ -526,18 +516,12 @@ panvk_per_arch(CmdPushDescriptorSetWithTemplate2KHR)(
    VK_FROM_HANDLE(vk_pipeline_layout, playout,
                   pPushDescriptorSetWithTemplateInfo->layout);
    const uint32_t set = pPushDescriptorSetWithTemplateInfo->set;
-   if (template->bind_point != VK_PIPELINE_BIND_POINT_GRAPHICS &&
-       template->bind_point != VK_PIPELINE_BIND_POINT_COMPUTE)
-      return;
-   if (set >= MESA_VK_MAX_DESCRIPTOR_SETS || set >= MAX_SETS ||
-       playout->set_layouts[set] == NULL)
-      return;
    const struct panvk_descriptor_set_layout *set_layout =
       to_panvk_descriptor_set_layout(playout->set_layouts[set]);
    struct panvk_descriptor_state *desc_state =
       panvk_cmd_get_desc_state(cmdbuf, template->bind_point);
-   struct panvk_descriptor_set *push_set = cmd_get_push_desc_set(
-      &cmdbuf->vk, desc_state, set, set_layout->desc_count);
+   struct panvk_descriptor_set *push_set =
+      cmd_get_push_desc_set(&cmdbuf->vk, desc_state, set);
    if (!push_set)
       return;
 

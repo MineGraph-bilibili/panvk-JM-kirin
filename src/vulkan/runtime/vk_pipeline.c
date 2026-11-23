@@ -664,12 +664,6 @@ struct vk_pipeline_precomp_shader {
    struct vk_sampler_state *embedded_samplers;
 
    struct blob nir_blob;
-
-   /* Live NIR for this process.  The serialized blob is never read back (see
-    * vk_pipeline_precomp_shader_get_nir), so this is the only source of NIR
-    * for shaders created or looked up in this process.
-    */
-   nir_shader *nir;
 };
 
 static struct vk_pipeline_precomp_shader *
@@ -738,7 +732,6 @@ vk_pipeline_precomp_shader_create(struct vk_device *device,
       shader->embedded_samplers[i] = embedded_samplers[i];
 
    shader->nir_blob = blob;
-   shader->nir = nir_shader_clone(NULL, nir);
 
    return shader;
 
@@ -748,10 +741,6 @@ fail_blob:
    return NULL;
 }
 
-/* Only used by VK_KHR_pipeline_binary.  The disk/pipeline cache serialization
- * path is disabled (see pipeline_precomp_shader_cache_ops); binaries produced
- * here are rejected on load by vk_pipeline_precomp_shader_deserialize().
- */
 static bool
 vk_pipeline_precomp_shader_serialize(struct vk_pipeline_cache_object *obj,
                                      struct blob *blob)
@@ -777,21 +766,62 @@ vk_pipeline_precomp_shader_deserialize(struct vk_device *device,
                                        const void *key_data, size_t key_size,
                                        struct blob_reader *blob)
 {
-   /* NIR blobs produced by this tree's nir_serialize() do not survive
-    * nir_deserialize(): the reader follows an out-of-range object index and
-    * crashes, because the bounds assert is compiled out in release builds.
-    * In-process NIR comes from vk_pipeline_precomp_shader::nir instead and
-    * serialization is disabled, so any entry arriving here was written by a
-    * different driver build.  Drop it and recompile from SPIR-V.
-    */
-   static bool warned;
-   if (!warned) {
-      mesa_logw("ignoring cached precomp shader entries: serialized NIR "
-                "cannot be deserialized by this driver");
-      warned = true;
-   }
+   const mesa_shader_stage stage = blob_read_uint32(blob);
 
-   blob->overrun = true;
+   struct vk_pipeline_robustness_state rs;
+   blob_copy_bytes(blob, &rs, sizeof(rs));
+
+   struct vk_pipeline_tess_info tess;
+   blob_copy_bytes(blob, &tess, sizeof(tess));
+
+   const uint32_t embedded_sampler_count = blob_read_uint32(blob);
+   const struct vk_sampler_state *embedded_samplers =
+      blob_read_bytes(blob, embedded_sampler_count * sizeof(*embedded_samplers));
+
+   uint64_t nir_size = blob_read_uint64(blob);
+   if (blob->overrun || nir_size > SIZE_MAX)
+      return NULL;
+
+   const void *nir_data = blob_read_bytes(blob, nir_size);
+   if (blob->overrun)
+      return NULL;
+
+   VK_MULTIALLOC(ma);
+   VK_MULTIALLOC_DECL(&ma, struct vk_pipeline_precomp_shader, shader, 1);
+   VK_MULTIALLOC_DECL(&ma, struct vk_sampler_state, samplers,
+                      embedded_sampler_count);
+   if (!vk_multialloc_zalloc(&ma, &device->alloc,
+                             VK_SYSTEM_ALLOCATION_SCOPE_DEVICE))
+      return NULL;
+
+   assert(sizeof(shader->cache_key) == key_size);
+   memcpy(shader->cache_key, key_data, sizeof(shader->cache_key));
+
+   vk_pipeline_cache_object_init(device, &shader->cache_obj,
+                                 &pipeline_precomp_shader_cache_ops,
+                                 shader->cache_key,
+                                 sizeof(shader->cache_key));
+
+   shader->stage = stage;
+   shader->rs = rs;
+   shader->tess = tess;
+
+   shader->embedded_sampler_count = embedded_sampler_count;
+   shader->embedded_samplers = samplers;
+   for (uint32_t i = 0; i < embedded_sampler_count; i++)
+      shader->embedded_samplers[i] = embedded_samplers[i];
+
+   blob_init(&shader->nir_blob);
+   blob_write_bytes(&shader->nir_blob, nir_data, nir_size);
+   if (shader->nir_blob.out_of_memory)
+      goto fail_cache_obj;
+
+   return &shader->cache_obj;
+
+fail_cache_obj:
+   vk_pipeline_cache_object_finish(&shader->cache_obj);
+   vk_free(&device->alloc, shader);
+
    return NULL;
 }
 
@@ -812,7 +842,6 @@ vk_pipeline_precomp_shader_destroy(struct vk_device *device,
       vk_pipeline_precomp_shader_from_cache_obj(obj);
 
    blob_finish(&shader->nir_blob);
-   ralloc_free(shader->nir);
    vk_pipeline_cache_object_finish(&shader->cache_obj);
    vk_free(&device->alloc, shader);
 }
@@ -821,9 +850,6 @@ static nir_shader *
 vk_pipeline_precomp_shader_get_nir(const struct vk_pipeline_precomp_shader *shader,
                                    const struct nir_shader_compiler_options *nir_options)
 {
-   if (shader->nir != NULL)
-      return nir_shader_clone(NULL, shader->nir);
-
    struct blob_reader blob;
    blob_reader_init(&blob, shader->nir_blob.data, shader->nir_blob.size);
 
@@ -837,6 +863,7 @@ vk_pipeline_precomp_shader_get_nir(const struct vk_pipeline_precomp_shader *shad
 }
 
 static const struct vk_pipeline_cache_object_ops pipeline_precomp_shader_cache_ops = {
+   .serialize = vk_pipeline_precomp_shader_serialize,
    .deserialize = vk_pipeline_precomp_shader_deserialize_cb,
    .destroy = vk_pipeline_precomp_shader_destroy,
 };

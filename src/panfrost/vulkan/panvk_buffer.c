@@ -122,48 +122,6 @@ panvk_CreateBuffer(VkDevice _device, const VkBufferCreateInfo *pCreateInfo,
    if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
       uint64_t va_range = panvk_buffer_get_sparse_size(buffer);
 
-      /* kbase assigns GPU VAs at BO allocation time and has no native sparse
-       * VM op, so the dummy-object emulation below can never map the range at
-       * the VA chosen by panvk_as_alloc().  Back the whole range with a real
-       * BO instead.  Growable regions (GROW_ON_GPF) keep a multi-GiB sparse
-       * buffer from pinning that much memory up front; the game only touches
-       * a small part of it.  The BO is never CPU-mapped (NO_MMAP), so only
-       * GPU page faults commit pages.  Fall back to a fully committed BO if
-       * the kernel rejects growable regions.
-       */
-      if (!pan_kmod_vm_supports_native_sparse(device->kmod.vm)) {
-         struct pan_kmod_bo *bo =
-            pan_kmod_bo_alloc(device->kmod.dev, device->kmod.vm, va_range,
-                              PAN_KMOD_BO_FLAG_NO_MMAP |
-                              PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT);
-         if (bo == NULL)
-            bo = pan_kmod_bo_alloc(device->kmod.dev, device->kmod.vm, va_range,
-                                   PAN_KMOD_BO_FLAG_NO_MMAP);
-         if (bo != NULL) {
-            struct pan_kmod_vm_op map = {
-               .type = PAN_KMOD_VM_OP_TYPE_MAP,
-               .va = {
-                  .start = PAN_KMOD_VM_MAP_AUTO_VA,
-                  .size = va_range,
-               },
-               .map = {
-                  .bo = bo,
-                  .bo_offset = 0,
-               },
-            };
-
-            int ret = pan_kmod_vm_bind(device->kmod.vm,
-                                       PAN_KMOD_VM_OP_MODE_IMMEDIATE, &map, 1);
-            if (ret == 0) {
-               buffer->sparse_backing = bo;
-               buffer->vk.device_address = map.va.start;
-               goto address_ready;
-            }
-
-            pan_kmod_bo_put(bo);
-         }
-      }
-
       buffer->vk.device_address =
          panvk_as_alloc(device, PANVK_NO_EXEC_VA_HEAP, va_range,
                         pan_choose_gpu_va_alignment(device->kmod.vm, va_range));
@@ -195,8 +153,6 @@ panvk_CreateBuffer(VkDevice _device, const VkBufferCreateInfo *pCreateInfo,
       }
    }
 
-address_ready:
-
    if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
       panvk_address_binding_report(device, &buffer->vk.base,
                                    buffer->vk.device_address,
@@ -227,9 +183,7 @@ panvk_DestroyBuffer(VkDevice _device, VkBuffer _buffer,
    if (!buffer)
       return;
 
-   if (buffer->sparse_backing != NULL) {
-      pan_kmod_bo_put(buffer->sparse_backing);
-   } else if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
+   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
       uint64_t va_range = panvk_buffer_get_sparse_size(buffer);
 
       panvk_address_binding_report(device, &buffer->vk.base,

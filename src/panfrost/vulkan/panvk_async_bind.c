@@ -408,40 +408,6 @@ panvk_async_bind_do(struct panvk_async_bind *submit,
    return panvk_async_bind_process_signals(submit);
 }
 
-/* kbase cannot run the async sparse bind below: it has no native sparse VM
- * op, PAN_KMOD_VM_OP_MODE_ASYNC is rejected by the kernel, and its vk_sync
- * objects are not DRM syncobjs, so vk_sync_as_drm_syncobj() returns NULL and
- * the syncobj path dereferences it.  Sparse buffers are backed by real BOs at
- * creation time, so there is nothing to map here; just run the waits and
- * signals on the CPU.
- */
-static VkResult
-panvk_queue_vm_bind_kbase(struct vk_queue *vk_queue,
-                          struct vk_queue_submit *vk_submit)
-{
-   struct panvk_device *device = to_panvk_device(vk_queue->base.device);
-   VkResult result;
-
-   for (uint32_t i = 0; i < vk_submit->wait_count; i++) {
-      const struct vk_sync_wait *wait = &vk_submit->waits[i];
-
-      result = vk_sync_wait(&device->vk, wait->sync, wait->wait_value,
-                            VK_SYNC_WAIT_COMPLETE, UINT64_MAX);
-      if (result != VK_SUCCESS)
-         return vk_queue_set_lost(vk_queue, "kbase sparse bind wait: %m");
-   }
-
-   for (uint32_t i = 0; i < vk_submit->signal_count; i++) {
-      const struct vk_sync_signal *signal = &vk_submit->signals[i];
-
-      result = vk_sync_signal(&device->vk, signal->sync, signal->signal_value);
-      if (result != VK_SUCCESS)
-         return vk_queue_set_lost(vk_queue, "kbase sparse bind signal: %m");
-   }
-
-   return VK_SUCCESS;
-}
-
 VkResult
 panvk_queue_vm_bind(struct vk_queue *vk_queue,
                     struct vk_queue_submit *vk_submit, uint32_t syncobj_handle)
@@ -449,9 +415,6 @@ panvk_queue_vm_bind(struct vk_queue *vk_queue,
    struct panvk_device *device = to_panvk_device(vk_queue->base.device);
    struct panvk_async_bind submit;
    VkResult result = VK_SUCCESS;
-
-   if (!pan_kmod_vm_supports_native_sparse(device->kmod.vm))
-      return panvk_queue_vm_bind_kbase(vk_queue, vk_submit);
 
    panvk_async_bind_init(&submit, device, syncobj_handle, vk_submit);
 

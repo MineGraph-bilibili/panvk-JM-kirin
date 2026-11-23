@@ -26,10 +26,6 @@
 
 #include "panvk_gs.h"
 
-/* JM exposes one GPU queue (panvk_physical_device.c: queueCount = arch >= 10 ? 2 : 1). That is
- * what lets the CPU treat an available wait semaphore as already submitted below. */
-static_assert(PAN_ARCH < 10, "kbase JM submission assumes a single GPU queue");
-
 #include "vk_drm_syncobj.h"
 #include "vk_framebuffer.h"
 
@@ -88,12 +84,6 @@ panvk_kbase_report_faults(struct panvk_device *dev, struct panvk_cmd_buffer *con
    unsigned b = 0;
    for (uint32_t j = 0; j < nr_cmdbufs; ++j) {
       list_for_each_entry(struct panvk_batch, batch, &cmdbufs[j]->batches, node) {
-         const struct panvk_priv_bo *heap = dev->tiler_heap[batch->tiler_heap];
-         mesa_loge("panvk: batch %u: heap %u (%zu KiB), tls %u B, vtc %u, frag %u", b,
-                   batch->tiler_heap,
-                   heap ? pan_kmod_bo_size(heap->bo) / 1024 : (size_t)0,
-                   batch->tlsinfo.tls.size, batch->vtc_jc.first_job != 0,
-                   batch->frag_jc.first_job != 0);
          unsigned k = 0;
          util_dynarray_foreach(&batch->jobs, void *, job) {
             const uint32_t *w = *job;
@@ -115,23 +105,17 @@ struct panvk_kbase_done {
    uint32_t *signals;
 };
 
-/* Once every atom of the submission has reported. A GPU fault poisons the device: stop the queue
- * instead of letting the next submission fault on top of it. The signals are still delivered so
- * nothing waits forever; the next submit and QueueWaitIdle return DEVICE_LOST. */
+/* On the kmod's event thread, when every atom of the submission has reported. The command
+ * buffers cannot have been reset or freed yet: they are pending until the signals below. */
 static void
-panvk_kbase_submit_finish(struct panvk_kbase_done *d, bool ok, bool gpu_event)
+panvk_kbase_submit_done(void *data, bool ok)
 {
+   struct panvk_kbase_done *d = data;
    struct panvk_device *dev = to_panvk_device(d->queue->vk.base.device);
 
    if (!ok) {
-      if (gpu_event) {
-         mesa_loge("panvk: the kbase submission faulted");
-         panvk_kbase_report_faults(dev, d->cmdbufs, d->nr_cmdbufs);
-         vk_device_set_lost(&dev->vk, "kbase submission faulted");
-      } else {
-         mesa_loge("panvk: the kbase submission was refused");
-         vk_device_set_lost(&dev->vk, "kbase submission refused");
-      }
+      mesa_loge("panvk: the kbase submission did not complete");
+      panvk_kbase_report_faults(dev, d->cmdbufs, d->nr_cmdbufs);
    }
 
    for (uint32_t j = 0; j < d->nr_cmdbufs; ++j) {
@@ -143,26 +127,6 @@ panvk_kbase_submit_finish(struct panvk_kbase_done *d, bool ok, bool gpu_event)
       dev->vk.sync->signal(dev->vk.sync, d->signals, d->nr_signals);
 
    free(d);
-}
-
-static void
-panvk_kbase_submit_done(void *data, bool ok)
-{
-   panvk_kbase_submit_finish(data, ok, !ok);
-}
-
-/* A submission the kmod refused before any atom was queued. */
-static void
-panvk_kbase_submit_aborted(struct panvk_kbase_done *d)
-{
-   panvk_kbase_submit_finish(d, false, false);
-}
-
-/* A submission whose GPU atoms faulted before the rest of it was prepared. */
-static void
-panvk_kbase_submit_faulted(struct panvk_kbase_done *d)
-{
-   panvk_kbase_submit_finish(d, false, true);
 }
 
 /*
@@ -235,23 +199,8 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
 
          /* More than one submission takes: send what there is, the rest runs after it. */
          if (nr_atoms + 2 > PAN_KMOD_KBASE_MAX_ATOMS) {
-            const uint64_t split_seq =
-               pan_kmod_kbase_submit_async(dev->kmod.dev, atoms, nr_atoms, NULL, NULL, NULL);
-            if (!split_seq) {
-               if (refresh)
-                  panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, 0);
-               panvk_kbase_submit_aborted(d);
-               return;
-            }
-            /* The rest of this submit rewrites batch job headers and tiler descriptors. The
-             * partial submission has no callback, so wait for it before touching that state. */
-            pan_kmod_kbase_wait_seq(dev->kmod.dev, split_seq);
-            if (pan_kmod_kbase_faulted(dev->kmod.dev)) {
-               if (refresh)
-                  panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, 0);
-               panvk_kbase_submit_faulted(d);
-               return;
-            }
+            if (!pan_kmod_kbase_submit_async(dev->kmod.dev, atoms, nr_atoms, NULL, NULL, NULL))
+               mesa_loge("panvk: the kbase submission was refused");
             nr_atoms = 0;
          }
 
@@ -329,7 +278,7 @@ panvk_queue_submit_kbase_chain(struct panvk_gpu_queue *queue, struct vk_queue_su
       panvk_per_arch(bc_emu_refresh_end)(dev, refresh, NULL, seq);
    if (!seq) {
       /* Signal anyway, so nothing waits forever on work that was never sent. */
-      panvk_kbase_submit_aborted(d);
+      panvk_kbase_submit_done(d, false);
       return;
    }
 
@@ -610,9 +559,6 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
 {
    struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-
-   if (vk_device_is_lost(&dev->vk))
-      return VK_ERROR_DEVICE_LOST;
 
    unsigned nr_semaphores = submit->wait_count + 1;
    uint32_t semaphores[nr_semaphores];

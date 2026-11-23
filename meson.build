@@ -1135,19 +1135,6 @@ if with_platform_android
         xclipse_gralloc / 'libs-a12' / 'android.hardware.graphics.mapper@4.0.so',
       ],
     )
-    # libui's GraphicBufferMapper picks the device's mapper itself: IMapper5 (stable-C,
-    # Android 15+, no HIDL service at all on Android 17) down to 2.0. The Android 12 libui
-    # already exports every getter u_gralloc_imapper5_api.cpp looks up.
-    dep_android_ui = declare_dependency(
-      compile_args : ['-I' + xclipse_gralloc / 'include'],
-      link_args : [
-        '-L' + xclipse_gralloc / 'libs-a12',
-        # XCLIPSE: no -lui. u_gralloc_imapper5_api.cpp opens libui.so at run time, so the
-        # driver still loads where libui is not visible (AdrenoTools' vendor namespace).
-        '-lutils', '-lcutils', '-lnativewindow', '-llog',
-        xclipse_gralloc / 'libs-a12' / 'libc++.so',
-      ],
-    )
   endif
   if not with_android_stub
     dep_android = [
@@ -2417,6 +2404,19 @@ if with_platform_x11
   if with_xlib_lease
     dep_xlib_xrandr = dependency('xrandr', version : dep_xlib_xrandr_version)
   endif
+endif
+
+if with_platform_android and with_any_vk
+  dep_xcb = dep_xcb.partial_dependency(compile_args : true, includes : true)
+  dep_xcb_xrandr = dep_xcb_xrandr.partial_dependency(compile_args : true, includes : true)
+  dep_x11_xcb = dep_x11_xcb.partial_dependency(compile_args : true, includes : true)
+  dep_xcb_dri3 = dep_xcb_dri3.partial_dependency(compile_args : true, includes : true)
+  dep_xcb_present = dep_xcb_present.partial_dependency(compile_args : true, includes : true)
+  dep_xcb_shm = dep_xcb_shm.partial_dependency(compile_args : true, includes : true)
+  dep_xcb_sync = dep_xcb_sync.partial_dependency(compile_args : true, includes : true)
+  dep_xcb_xfixes = dep_xcb_xfixes.partial_dependency(compile_args : true, includes : true)
+  dep_xshmfence = dep_xshmfence.partial_dependency(compile_args : true, includes : true)
+  pre_args += '-DWSI_X11_DLOPEN'
 endif
 
 if with_dri

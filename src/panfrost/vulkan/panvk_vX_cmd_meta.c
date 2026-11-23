@@ -7,7 +7,6 @@
 #include "kmod/kbase_kmod.h"
 #include "panvk_bc_emu.h"
 #include "panvk_buffer.h"
-#include "panvk_cmd_alloc.h"
 #include "panvk_cmd_meta.h"
 #include "panvk_entrypoints.h"
 #include "panvk_meta.h"
@@ -20,37 +19,6 @@
 #include "libpan.h"
 #include "libpan_copy.h"
 #include "libpan_dgc.h"
-
-/* The save context keeps a fixed-size copy of the push descriptors, but a set
- * layout may hold more descriptors than maxPushDescriptors (MAX_PUSH_DESCS).
- * Fall back to command buffer pool memory for the oversized case instead of
- * smashing the stack.
- */
-static bool
-meta_save_push_descs(struct panvk_cmd_buffer *cmdbuf,
-                     struct panvk_opaque_desc *inline_storage,
-                     struct panvk_opaque_desc **storage,
-                     struct panvk_descriptor_set *push_set)
-{
-   const uint32_t count = push_set->desc_count;
-
-   *storage = inline_storage;
-   if (count > MAX_PUSH_DESCS) {
-      struct pan_ptr ptr = panvk_cmd_alloc_from_pool(
-         cmdbuf, &cmdbuf->desc_pool,
-         (struct panvk_pool_alloc_info){
-            .size = count * PANVK_DESCRIPTOR_SIZE,
-            .alignment = 8,
-         });
-      *storage = ptr.cpu;
-   }
-
-   if (!*storage)
-      return false;
-
-   memcpy(*storage, push_set->descs.host, count * PANVK_DESCRIPTOR_SIZE);
-   return true;
-}
 
 static bool
 copy_to_image_use_gfx_pipeline(struct panvk_image *dst_img)
@@ -123,10 +91,8 @@ meta_compute_start(struct panvk_cmd_buffer *cmdbuf,
       save_ctx->push_set0.descs_dev_addr = push_set0->descs.dev;
       save_ctx->push_set0.dirty =
          BITSET_TEST(cmdbuf->state.compute.desc_state.dirty_push_sets, 0);
-      if (save_ctx->push_set0.desc_count &&
-          !meta_save_push_descs(cmdbuf, save_ctx->push_set0.inline_storage,
-                                &save_ctx->push_set0.storage, push_set0))
-         save_ctx->push_set0.desc_count = 0;
+      memcpy(save_ctx->push_set0.desc_storage, push_set0->descs.host,
+             push_set0->desc_count * PANVK_DESCRIPTOR_SIZE);
    }
 
    save_ctx->push_constants = cmdbuf->state.push_constants;
@@ -161,7 +127,7 @@ meta_compute_end(struct panvk_cmd_buffer *cmdbuf,
 
    cmdbuf->state.compute.desc_state.sets[0] = save_ctx->set0;
    if (save_ctx->push_set0.desc_count) {
-      memcpy(push_set0->descs.host, save_ctx->push_set0.storage,
+      memcpy(push_set0->descs.host, save_ctx->push_set0.desc_storage,
              save_ctx->push_set0.desc_count * PANVK_DESCRIPTOR_SIZE);
       push_set0->descs.dev = save_ctx->push_set0.descs_dev_addr;
       push_set0->desc_count = save_ctx->push_set0.desc_count;
@@ -200,10 +166,8 @@ meta_gfx_start(struct panvk_cmd_buffer *cmdbuf,
       save_ctx->push_set0.descs_dev_addr = push_set0->descs.dev;
       save_ctx->push_set0.dirty =
          BITSET_TEST(cmdbuf->state.gfx.desc_state.dirty_push_sets, 0);
-      if (save_ctx->push_set0.desc_count &&
-          !meta_save_push_descs(cmdbuf, save_ctx->push_set0.inline_storage,
-                                &save_ctx->push_set0.storage, push_set0))
-         save_ctx->push_set0.desc_count = 0;
+      memcpy(save_ctx->push_set0.desc_storage, push_set0->descs.host,
+             push_set0->desc_count * PANVK_DESCRIPTOR_SIZE);
    }
 
    save_ctx->push_constants = cmdbuf->state.push_constants;
@@ -258,7 +222,7 @@ meta_gfx_end(struct panvk_cmd_buffer *cmdbuf,
 
    cmdbuf->state.gfx.desc_state.sets[0] = save_ctx->set0;
    if (save_ctx->push_set0.desc_count) {
-      memcpy(push_set0->descs.host, save_ctx->push_set0.storage,
+      memcpy(push_set0->descs.host, save_ctx->push_set0.desc_storage,
              save_ctx->push_set0.desc_count * PANVK_DESCRIPTOR_SIZE);
       push_set0->descs.dev = save_ctx->push_set0.descs_dev_addr;
       push_set0->desc_count = save_ctx->push_set0.desc_count;
