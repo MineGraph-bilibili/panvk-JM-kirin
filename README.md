@@ -62,10 +62,6 @@ English: PanVK job-manager backend for Kirin devices, based on [JimVulkan/mali-p
 6. **构建优化**
    `-Os`、关闭 `panfrost-disassemble`，只编译 JM v6 / v7 / v9；正式包体积比全量构建明显减小。
 
-## 不支持 DX12
-
-本驱动**不支持 DX12 / vkd3d-proton**。请使用 DXVK 的 D3D9 / D3D10 / D3D11 路径；DX12 游戏无法启动或会在创建 Vulkan 设备时失败。
-
 ## 构建
 
 Linux / WSL，需要 Android NDK（API 31 arm64）、meson、ninja、glslangValidator，以及带 clang / libclc / SPIR-V 翻译器的 LLVM：
